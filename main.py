@@ -8,7 +8,11 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 from transformers import BertTokenizer
+from transformers import TFBertModel
 from tensorflow.keras.layers import Dropout, Dense
+from tensorflow.keras.losses import SparseCategoricalCrossentropy
+from tensorflow.keras.optimizers import Adam
+from tensorflow.keras.metrics import SparseCategoricalAccuracy
 
 model_name = "bert-base-cased"
 tokenizer = BertTokenizer.from_pretrained(model_name)
@@ -72,10 +76,30 @@ intent_train = df_train["intent_label"].map(intent_map).values
 intent_valid = df_valid["intent_label"].map(intent_map).values
 intent_test = df_test["intent_label"].map(intent_map).values
 
+base_bert_model = TFBertModel.from_pretrained("bert-base-cased")
+
 slot_names = ["[PAD]"] + Path("vocab.slot").read_text().strip().splitlines()
 slot_map = {}
 for label in slot_names:
     slot_map[label] = len(slot_map)
+
+def encode_token_labels(text_sequences, true_word_labels):
+    encoded = np.zeros(shape=(len(text_sequences), max_token_len), dtype=np.int32)
+    for i, (text_sequence, word_labels) in enumerate(zip(text_sequences, true_word_labels)):
+        encoded_labels = []
+        for word, word_label in zip(text_sequence.split(), word_labels.split()):
+            tokens = tokenizer.tokenize(word)
+            encoded_labels.append(slot_map[word_label])
+            expand_label = word_label.replace("B-", "I-")
+            if not expand_label in slot_map:
+                expand_label = word_label
+            encoded_labels.extend([slot_map[expand_label]] * (len(tokens) - 1))
+        encoded[i, 1:len(encoded_labels) + 1] = encoded_labels
+    return encoded
+
+slot_train = encode_token_labels(df_train["words"], df_train["word_labels"])
+slot_valid = encode_token_labels(df_valid["words"], df_valid["word_labels"])
+slot_test = encode_token_labels(df_test["words"], df_test["word_labels"])
 
 class JointIntentAndSlotFillingModel(tf.keras.Model):
 
@@ -126,6 +150,13 @@ class JointIntentAndSlotFillingModel(tf.keras.Model):
 joint_model = JointIntentAndSlotFillingModel( \
     intent_num_labels=len(intent_map), slot_num_labels=len(slot_map))
 
+losses = [SparseCategoricalCrossentropy(from_logits=True),
+          SparseCategoricalCrossentropy(from_logits=True)]
+
+joint_model.compile(optimizer=Adam(learning_rate=3e-5, epsilon=1e-08), loss=losses,metrics=[SparseCategoricalAccuracy('accuracy')], run_eagerly=True)
+
+history = joint_model.fit(encoded_train, (slot_train, intent_train), validation_data=(encoded_valid, (slot_valid, intent_valid)), epochs=1, batch_size=32)
+
 def show_predictions(text, intent_names, slot_names):
     inputs = tf.constant(tokenizer.encode(text))[None, :]  # batch_size = 1
     outputs = joint_model(inputs)
@@ -150,7 +181,6 @@ def index():
     if request.method == 'POST':
       form = request.form
       result = []
-      bert_abstract = form['paragraph']
       question = form['question']
       result.append(form['question'])
       result.append(answer_question(question))
